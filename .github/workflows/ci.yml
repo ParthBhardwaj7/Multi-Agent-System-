@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Ruff (lint + format check)
+        run: |
+          ruff check app tests scripts migrations
+          ruff format --check app tests scripts migrations
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Mypy
+        run: mypy app
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Unit tests
+        run: pytest tests/unit -v --cov=app --cov-report=term-missing --cov-report=xml
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orchestrator
+          POSTGRES_PASSWORD: orchestrator
+          POSTGRES_DB: orchestrator
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U orchestrator"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run migrations
+        run: python -m alembic -c migrations/alembic.ini upgrade head
+      - name: Integration + E2E + security tests
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://orchestrator:orchestrator@localhost:5434/orchestrator
+          TEST_DATABASE_RO_URL: postgresql+asyncpg://orchestrator_ro:orchestrator_ro@localhost:5434/orchestrator
+          TEST_REDIS_URL: redis://localhost:6390/15
+        run: |
+          psql_missing=0  # create the read-only role via python (no psql on runner)
+          python - <<'EOF'
+          import asyncio, os
+          from app.db.engine import create_db_engine
+          from sqlalchemy import text
+          async def main():
+              engine = create_db_engine(os.environ["TEST_DATABASE_URL"].replace("+asyncpg", ""))
+              async with engine.begin() as conn:
+                  await conn.execute(text("COMMIT")) if False else None
+              await engine.dispose()
+          asyncio.run(main())
+          EOF
+          python - <<'EOF'
+          import asyncio, os
+          import asyncpg
+          async def main():
+              conn = await asyncpg.connect("postgresql://orchestrator:orchestrator@localhost:5434/orchestrator")
+              await conn.execute("""
+                  DO $$
+                  BEGIN
+                      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'orchestrator_ro') THEN
+                          CREATE ROLE orchestrator_ro LOGIN PASSWORD 'orchestrator_ro';
+                      END IF;
+                  END
+                  $$;
+              """)
+              await conn.execute("GRANT USAGE ON SCHEMA public TO orchestrator_ro")
+              await conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO orchestrator_ro")
+              await conn.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO orchestrator_ro")
+              await conn.close()
+          asyncio.run(main())
+          EOF
+          pytest tests/integration tests/e2e tests/security -v
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Bandit (SAST)
+        run: bandit -c pyproject.toml -r app -f json -o bandit-report.json || true
+      - name: Show bandit summary
+        run: bandit -c pyproject.toml -r app --severity-level medium --skip B101 -q
+      - name: pip-audit (dependency vulnerabilities)
+        run: pip-audit --skip-editable
+
+  evaluation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e .
+      - name: Run evaluation (heuristic router — CI mode, no API keys)
+        run: |
+          python scripts/generate_eval_dataset.py
+          python scripts/run_evaluation.py --router heuristic
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          tags: multi-agent-orchestrator:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
